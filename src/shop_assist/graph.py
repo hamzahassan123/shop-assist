@@ -2,15 +2,15 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
-from shop_assist.tools import lookup_order
+from shop_assist.tools import lookup_order, lookup_fulfillment
 
 
 llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",
-    temperature=0,
+    temperature=0.1,
 )
 
-tools = [lookup_order]
+tools = [lookup_order, lookup_fulfillment]
 
 llm_with_tools = llm.bind_tools(tools)
 
@@ -40,18 +40,19 @@ When a customer asks about a specific order:
     return {"messages": [response]}
 
 
-builder = StateGraph(MessagesState)
+def build_graph(checkpointer):
+    builder = StateGraph(MessagesState)
 
-builder.add_node("agent", call_model)
-builder.add_node("tools", ToolNode(tools))
+    builder.add_node("agent", call_model)
+    builder.add_node("tools", ToolNode(tools))
 
-builder.set_entry_point("agent")
+    builder.set_entry_point("agent")
 
-builder.add_conditional_edges(
-    "agent",
-    tools_condition,
-)
+    builder.add_conditional_edges(
+        "agent",
+        tools_condition,
+    )
 
-builder.add_edge("tools", "agent")
+    builder.add_edge("tools", "agent")
 
-graph = builder.compile()
+    return builder.compile(checkpointer=checkpointer)

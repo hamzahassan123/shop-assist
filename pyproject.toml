@@ -8,9 +8,12 @@ authors = [
 ]
 requires-python = ">=3.14"
 dependencies = [
+    "faiss-cpu>=1.15.1",
     "langchain>=1.4.2",
+    "langchain-community>=0.4.2",
     "langchain-core>=1.6.5",
     "langchain-google-genai>=4.4.0",
+    "langchain-huggingface>=1.2.2",
     "langgraph-checkpoint-postgres>=3.1.2",
     "psycopg[binary]>=3.3.6",
     "python-dotenv>=1.2.3",
