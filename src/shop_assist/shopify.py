@@ -202,3 +202,78 @@ def get_fulfillment(order_number: str) -> dict | None:
             for fulfillment in order["fulfillments"]
         ],
     }
+
+
+def cancel_order(
+    order_number: str,
+    reason: str = "CUSTOMER",
+    notify_customer: bool = True,
+    restock: bool = True,
+) -> dict:
+    order = get_order(order_number)
+
+    if order is None:
+        return {
+            "success": False,
+            "message": f"Order #{order_number.lstrip('#')} was not found.",
+        }
+
+    mutation = """
+    mutation OrderCancel(
+        $orderId: ID!
+        $notifyCustomer: Boolean
+        $refundMethod: OrderCancelRefundMethodInput!
+        $restock: Boolean!
+        $reason: OrderCancelReason!
+        $staffNote: String
+    ) {
+        orderCancel(
+            orderId: $orderId
+            notifyCustomer: $notifyCustomer
+            refundMethod: $refundMethod
+            restock: $restock
+            reason: $reason
+            staffNote: $staffNote
+        ) {
+            job {
+                id
+                done
+            }
+            orderCancelUserErrors {
+                field
+                message
+                code
+            }
+        }
+    }
+    """
+
+    variables = {
+        "orderId": order["id"],
+        "notifyCustomer": notify_customer,
+        "refundMethod": {
+            "originalPaymentMethodsRefund": True
+        },
+        "restock": restock,
+        "reason": reason,
+        "staffNote": "Cancellation requested through ShopAssist.",
+    }
+
+    result = shopify_graphql(mutation, variables)
+
+    cancellation = result["data"]["orderCancel"]
+
+    errors = cancellation["orderCancelUserErrors"]
+
+    if errors:
+        return {
+            "success": False,
+            "message": "Shopify rejected the cancellation.",
+            "errors": errors,
+        }
+
+    return {
+        "success": True,
+        "message": f"Order #{order_number.lstrip('#')} cancellation started.",
+        "job": cancellation["job"],
+    }

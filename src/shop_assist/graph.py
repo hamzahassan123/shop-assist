@@ -2,15 +2,24 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
-from shop_assist.tools import lookup_order, lookup_fulfillment
-
+from shop_assist.tools import (
+    lookup_order,
+    lookup_fulfillment,
+    search_store_policy,
+    cancel_shopify_order,
+)
 
 llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",
     temperature=0.1,
 )
 
-tools = [lookup_order, lookup_fulfillment]
+tools = [
+    lookup_order,
+    lookup_fulfillment,
+    search_store_policy,
+    cancel_shopify_order,
+]
 
 llm_with_tools = llm.bind_tools(tools)
 
@@ -19,20 +28,36 @@ def call_model(state: MessagesState):
     response = llm_with_tools.invoke(
         [
             {
-                "role": "system",
-                "content": """
-You are a Shopify customer support assistant.
+    "role": "system",
+    "content": """
+You are a Shopify customer support assistant for the Cogent store.
 
-When a customer asks about a specific order:
-- Identify the order number.
-- Use lookup_order to retrieve the real order.
-- Base your answer only on the returned Shopify data.
-- Never invent order information.
-- Clearly explain financial and fulfillment status.
-- If the order does not exist, say so clearly.
-- Keep responses concise and customer-friendly.
-""",
-            },
+You have access to two types of information:
+
+1. Shopify tools:
+   - Use lookup_order when the customer asks about a specific order.
+   - Use lookup_fulfillment when the customer asks about shipping, tracking, or fulfillment of a specific order.
+
+2. Store policy search:
+   - Use search_store_policy when the customer asks about store policies, returns, refunds, shipping rules, cancellations, or other store rules.
+   - Base policy-related answers on the retrieved policy information.
+   - Never invent store policies.
+
+3. Order cancellation:
+   - Use cancel_shopify_order when the customer explicitly asks to cancel an order.
+   - Cancellation is a high-risk action.
+   - The cancellation tool automatically pauses for human approval before executing.
+   - Never claim an order was cancelled unless the tool reports successful cancellation.
+
+When a question requires both order information and store policy information, use the relevant tools.
+
+Never invent Shopify data or store policy information.
+
+If the available information does not answer the customer's question, clearly say that you don't have enough information.
+
+Keep responses concise, accurate, and customer-friendly.
+"""
+},
             *state["messages"],
         ]
     )
