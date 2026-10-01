@@ -19,6 +19,7 @@ dependencies = [
     "python-dotenv>=1.2.3",
     "requests>=2.34.2",
     "sentence-transformers>=6.1.0",
+    "streamlit>=1.64.0",
 ]
 
 [project.scripts]

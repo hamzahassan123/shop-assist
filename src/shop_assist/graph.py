@@ -9,10 +9,25 @@ from shop_assist.tools import (
     cancel_shopify_order,
 )
 
-llm = ChatGoogleGenerativeAI(
+primary_llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",
     temperature=0.1,
+    max_retries=2,
 )
+
+fallback_llm_1 = ChatGoogleGenerativeAI(
+    model="gemini-2.0-flash",
+    temperature=0.1,
+    max_retries=2,
+)
+
+fallback_llm_2 = ChatGoogleGenerativeAI(
+    model="gemini-1.5-flash",
+    temperature=0.1,
+    max_retries=2,
+)
+
+base_llm = primary_llm.with_fallbacks([fallback_llm_1, fallback_llm_2])
 
 tools = [
     lookup_order,
@@ -21,7 +36,7 @@ tools = [
     cancel_shopify_order,
 ]
 
-llm_with_tools = llm.bind_tools(tools)
+llm_with_tools = base_llm.bind_tools(tools)
 
 
 def call_model(state: MessagesState):
