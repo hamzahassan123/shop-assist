@@ -9,20 +9,25 @@ from shop_assist.tools import (
     cancel_shopify_order,
 )
 
+import streamlit as st
+
 primary_llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",
+    google_api_key=st.secrets.get("GOOGLE_API_KEY"),
     temperature=0.1,
     max_retries=2,
 )
 
 fallback_llm_1 = ChatGoogleGenerativeAI(
     model="gemini-2.0-flash",
+    google_api_key=st.secrets.get("GOOGLE_API_KEY"),
     temperature=0.1,
     max_retries=2,
 )
 
 fallback_llm_2 = ChatGoogleGenerativeAI(
     model="gemini-1.5-flash",
+    google_api_key=st.secrets.get("GOOGLE_API_KEY"),
     temperature=0.1,
     max_retries=2,
 )
