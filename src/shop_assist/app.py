@@ -1,4 +1,5 @@
 import uuid
+import logging
 
 import streamlit as st
 from langchain_core.messages import AIMessage, HumanMessage
@@ -9,6 +10,12 @@ from shop_assist.db import (
     get_conversations,
 )
 from shop_assist.graph import build_graph
+from shop_assist.logging_config import configure_logging
+
+
+configure_logging()
+
+logger = logging.getLogger(__name__)
 
 
 # =========================================================
@@ -45,7 +52,6 @@ def content_to_text(content) -> str:
         return content
 
     if isinstance(content, list):
-
         text_parts = []
 
         for block in content:
@@ -67,18 +73,14 @@ def content_to_text(content) -> str:
 
 
 def run_graph(input_data, config):
-    """
-    Execute LangGraph using PostgreSQL persistence.
-    """
+    try:
+        with get_checkpointer() as checkpointer:
+            graph = build_graph(checkpointer)
+            return graph.invoke(input_data, config)
 
-    with get_checkpointer() as checkpointer:
-
-        graph = build_graph(checkpointer)
-
-        return graph.invoke(
-            input_data,
-            config,
-        )
+    except Exception:
+        logger.exception("Graph execution failed")
+        raise
 
 
 def load_conversation(config):
@@ -368,65 +370,103 @@ if st.session_state.pending_interrupt:
             use_container_width=True,
         )
 
+    # -----------------------------------------------------
+    # APPROVE CANCELLATION
+    # -----------------------------------------------------
+
     if approve:
 
-        with st.spinner(
-            "Processing cancellation..."
-        ):
+        try:
 
-            result = run_graph(
-                Command(
-                    resume={
-                        "action": "approve"
-                    }
-                ),
-                config,
+            with st.spinner(
+                "Processing cancellation..."
+            ):
+
+                result = run_graph(
+                    Command(
+                        resume={
+                            "action": "approve"
+                        }
+                    ),
+                    config,
+                )
+
+        except Exception:
+
+            logger.exception(
+                "Failed to process approved cancellation"
             )
 
-        st.session_state.pending_interrupt = None
+            st.error(
+                "Sorry, the cancellation could not be "
+                "processed. Please try again."
+            )
 
-        response = content_to_text(
-            result["messages"][-1].content
-        )
+        else:
 
-        st.session_state.messages.append(
-            {
-                "role": "assistant",
-                "content": response,
-            }
-        )
+            st.session_state.pending_interrupt = None
 
-        st.rerun()
+            response = content_to_text(
+                result["messages"][-1].content
+            )
+
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": response,
+                }
+            )
+
+            st.rerun()
+
+    # -----------------------------------------------------
+    # REJECT CANCELLATION
+    # -----------------------------------------------------
 
     if reject:
 
-        with st.spinner(
-            "Rejecting cancellation..."
-        ):
+        try:
 
-            result = run_graph(
-                Command(
-                    resume={
-                        "action": "reject"
-                    }
-                ),
-                config,
+            with st.spinner(
+                "Rejecting cancellation..."
+            ):
+
+                result = run_graph(
+                    Command(
+                        resume={
+                            "action": "reject"
+                        }
+                    ),
+                    config,
+                )
+
+        except Exception:
+
+            logger.exception(
+                "Failed to process rejected cancellation"
             )
 
-        st.session_state.pending_interrupt = None
+            st.error(
+                "Sorry, we could not process your "
+                "cancellation decision. Please try again."
+            )
 
-        response = content_to_text(
-            result["messages"][-1].content
-        )
+        else:
 
-        st.session_state.messages.append(
-            {
-                "role": "assistant",
-                "content": response,
-            }
-        )
+            st.session_state.pending_interrupt = None
 
-        st.rerun()
+            response = content_to_text(
+                result["messages"][-1].content
+            )
+
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": response,
+                }
+            )
+
+            st.rerun()
 
 
 # =========================================================
@@ -454,54 +494,69 @@ if not st.session_state.pending_interrupt:
 
         with st.chat_message("assistant"):
 
-            with st.spinner("Thinking..."):
+            try:
 
-                result = run_graph(
-                    {
-                        "messages": [
-                            HumanMessage(
-                                content=prompt
-                            )
-                        ]
-                    },
-                    config,
+                with st.spinner("Thinking..."):
+
+                    result = run_graph(
+                        {
+                            "messages": [
+                                HumanMessage(
+                                    content=prompt
+                                )
+                            ]
+                        },
+                        config,
+                    )
+
+            except Exception:
+
+                logger.exception(
+                    "Failed to process customer message"
                 )
 
-            # -----------------------------------------
-            # HITL interrupt
-            # -----------------------------------------
-
-            if "__interrupt__" in result:
-
-                interrupt_data = (
-                    result[
-                        "__interrupt__"
-                    ][0].value
+                st.error(
+                    "Sorry, something went wrong while "
+                    "processing your request. Please try again."
                 )
-
-                st.session_state.pending_interrupt = (
-                    interrupt_data
-                )
-
-                st.rerun()
-
-            # -----------------------------------------
-            # Normal response
-            # -----------------------------------------
 
             else:
 
-                response = content_to_text(
-                    result[
-                        "messages"
-                    ][-1].content
-                )
+                # -----------------------------------------
+                # HITL interrupt
+                # -----------------------------------------
 
-                st.markdown(response)
+                if "__interrupt__" in result:
 
-                st.session_state.messages.append(
-                    {
-                        "role": "assistant",
-                        "content": response,
-                    }
-                )
+                    interrupt_data = (
+                        result[
+                            "__interrupt__"
+                        ][0].value
+                    )
+
+                    st.session_state.pending_interrupt = (
+                        interrupt_data
+                    )
+
+                    st.rerun()
+
+                # -----------------------------------------
+                # Normal response
+                # -----------------------------------------
+
+                else:
+
+                    response = content_to_text(
+                        result[
+                            "messages"
+                        ][-1].content
+                    )
+
+                    st.markdown(response)
+
+                    st.session_state.messages.append(
+                        {
+                            "role": "assistant",
+                            "content": response,
+                        }
+                    )

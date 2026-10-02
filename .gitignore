@@ -9,3 +9,13 @@ wheels/
 # Virtual environments
 .venv
 .env
+.env.*
+!.env.example
+
+.venv/
+__pycache__/
+*.pyc
+
+.streamlit/secrets.toml
+
+*.log
