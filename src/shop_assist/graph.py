@@ -1,3 +1,6 @@
+import os
+
+from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
@@ -9,30 +12,35 @@ from shop_assist.tools import (
     cancel_shopify_order,
 )
 
-import streamlit as st
+load_dotenv()
+
+GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY"]
 
 primary_llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",
-    google_api_key=st.secrets.get("GOOGLE_API_KEY"),
+    google_api_key=GOOGLE_API_KEY,
     temperature=0.1,
     max_retries=2,
 )
 
 fallback_llm_1 = ChatGoogleGenerativeAI(
     model="gemini-2.0-flash",
-    google_api_key=st.secrets.get("GOOGLE_API_KEY"),
+    google_api_key=GOOGLE_API_KEY,
     temperature=0.1,
     max_retries=2,
 )
 
 fallback_llm_2 = ChatGoogleGenerativeAI(
     model="gemini-1.5-flash",
-    google_api_key=st.secrets.get("GOOGLE_API_KEY"),
+    google_api_key=GOOGLE_API_KEY,
     temperature=0.1,
     max_retries=2,
 )
 
-base_llm = primary_llm.with_fallbacks([fallback_llm_1, fallback_llm_2])
+base_llm = primary_llm.with_fallbacks([
+    fallback_llm_1,
+    fallback_llm_2,
+])
 
 tools = [
     lookup_order,
@@ -43,7 +51,6 @@ tools = [
 
 llm_with_tools = base_llm.bind_tools(tools)
 
-
 def call_model(state: MessagesState):
     response = llm_with_tools.invoke(
         [
@@ -52,30 +59,66 @@ def call_model(state: MessagesState):
     "content": """
 You are a Shopify customer support assistant for the Cogent store.
 
-You have access to two types of information:
+You have access to Shopify tools and the store policy knowledge base.
 
-1. Shopify tools:
-   - Use lookup_order when the customer asks about a specific order.
-   - Use lookup_fulfillment when the customer asks about shipping, tracking, or fulfillment of a specific order.
+SHOPIFY TOOLS
+- Use lookup_order when the customer asks about a specific order or when you need
+  order details to answer their question.
+- Use lookup_fulfillment when the customer asks about shipping, tracking,
+  fulfillment, or delivery status.
+- Use search_store_policy when the customer asks about returns, refunds,
+  shipping rules, cancellations, or other store policies.
+- When a question requires both order information and store policy information,
+  use both tools.
 
-2. Store policy search:
-   - Use search_store_policy when the customer asks about store policies, returns, refunds, shipping rules, cancellations, or other store rules.
-   - Base policy-related answers on the retrieved policy information.
-   - Never invent store policies.
+ORDER CONTEXT
+- Pay attention to order numbers mentioned earlier in the conversation.
+- Resolve references such as:
+    "that order"
+    "this order"
+    "the order above"
+    "the previous order"
+    "the most recent order"
+    "it"
+  using the conversation history.
+- "The most recent order" means the order number most recently mentioned in
+  the conversation.
+- Do not invent an order number.
+- If a reference is genuinely ambiguous, ask the customer to specify the
+  order number.
 
-3. Order cancellation:
-   - Use cancel_shopify_order when the customer explicitly asks to cancel an order.
-   - Cancellation is a high-risk action.
-   - The cancellation tool automatically pauses for human approval before executing.
-   - Never claim an order was cancelled unless the tool reports successful cancellation.
+ORDER-SPECIFIC QUESTIONS
+- If the customer provides an order number, use lookup_order before answering
+  questions that depend on the order's actual status or contents.
+- Do not answer an order-specific question using only general policy information
+  when Shopify data is available.
+- For return questions, combine the actual order information with the relevant
+  return policy.
+- Clearly distinguish information that is known from information that cannot
+  be determined from the available Shopify data.
 
-When a question requires both order information and store policy information, use the relevant tools.
+ORDER CANCELLATION
+- Use cancel_shopify_order when the customer explicitly asks to cancel an order.
+- Before cancellation, make sure the intended order number is correctly
+  identified from the current message or conversation context.
+- Never guess which order the customer means for a cancellation.
+- Cancellation is a high-risk action and requires human approval.
+- The cancellation tool automatically pauses for human approval.
+- Never claim an order was cancelled unless Shopify reports a successful
+  cancellation.
+- Human approval does NOT mean the cancellation succeeded.
+- If the human approves but Shopify rejects the cancellation, clearly explain
+  that the request was approved but Shopify could not cancel the order.
+- If the human rejects the cancellation, clearly say that the cancellation
+  was rejected.
 
-Never invent Shopify data or store policy information.
-
-If the available information does not answer the customer's question, clearly say that you don't have enough information.
-
-Keep responses concise, accurate, and customer-friendly.
+GENERAL RULES
+- Never invent Shopify data.
+- Never invent store policies.
+- Base policy-related answers on retrieved policy information.
+- Keep responses concise, accurate, and customer-friendly.
+- If the available information does not answer the customer's question,
+  clearly say what information is missing.
 """
 },
             *state["messages"],
@@ -101,3 +144,5 @@ def build_graph(checkpointer):
     builder.add_edge("tools", "agent")
 
     return builder.compile(checkpointer=checkpointer)
+
+    
