@@ -1,10 +1,10 @@
 import os
 
-import psycopg
-from psycopg.rows import dict_row
 import streamlit as st
 from dotenv import load_dotenv
 from langgraph.checkpoint.postgres import PostgresSaver
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 from shop_assist.utils import content_to_text
 
@@ -15,13 +15,24 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 
 @st.cache_resource
 def get_checkpointer():
-    connection = psycopg.connect(
-        DATABASE_URL,
-        autocommit=True,
-        prepare_threshold=0,
-        row_factory=dict_row,
+    pool = ConnectionPool(
+        conninfo=DATABASE_URL,
+        kwargs={
+            "autocommit": True,
+            "prepare_threshold": 0,
+            "row_factory": dict_row,
+        },
+        min_size=1,
+        max_size=5,
+        timeout=30,
+        max_lifetime=1800,
+        max_idle=180,
+        reconnect_timeout=300,
+        check=ConnectionPool.check_connection,
+        open=False,
     )
-    checkpointer = PostgresSaver(connection)
+    pool.open(wait=True)
+    checkpointer = PostgresSaver(pool)
     checkpointer.setup()
     return checkpointer
 

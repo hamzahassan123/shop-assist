@@ -15,7 +15,7 @@ ShopAssist is an AI customer support agent for Shopify stores, built with Stream
 - **Real-time streaming:** LangGraph v2 `graph.stream` events stream model tokens and display tool progress. The app uses the synchronous stream API with `PostgresSaver`; it does not use `astream_events`.
 - **Session isolation:** A browser cookie namespaces conversation thread IDs so the sidebar only lists conversations for that browser session. This is session isolation, not authentication.
 - **PII redaction:** Email addresses, common phone numbers, and credit card number patterns in prompts are redacted before they are sent to the graph.
-- **PostgreSQL checkpointing:** A cached PostgreSQL checkpointer persists conversation state and supports resuming conversations.
+- **PostgreSQL checkpointing:** A cached, health-checked psycopg connection pool backs the PostgreSQL checkpointer, helping it recover from idle database connections and supporting conversation resumption.
 
 ## 🏗️ Architecture
 
