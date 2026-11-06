@@ -52,11 +52,10 @@ tools = [
 llm_with_tools = base_llm.bind_tools(tools)
 
 def call_model(state: MessagesState):
-    response = llm_with_tools.invoke(
-        [
-            {
-    "role": "system",
-    "content": """
+    messages = [
+        {
+            "role": "system",
+            "content": """
 You are a Shopify customer support assistant for the Cogent store.
 
 You have access to Shopify tools and the store policy knowledge base.
@@ -119,12 +118,17 @@ GENERAL RULES
 - Keep responses concise, accurate, and customer-friendly.
 - If the available information does not answer the customer's question,
   clearly say what information is missing.
-"""
-},
-            *state["messages"],
-        ]
-    )
+""",
+        },
+        *state["messages"],
+    ]
 
+    response = None
+    for chunk in llm_with_tools.stream(messages):
+        response = chunk if response is None else response + chunk
+
+    if response is None:
+        raise RuntimeError("The chat model returned no response.")
     return {"messages": [response]}
 
 

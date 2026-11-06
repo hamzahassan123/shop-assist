@@ -2,8 +2,7 @@ from shop_assist.db import get_checkpointer
 
 
 def main():
-    with get_checkpointer() as checkpointer:
-        checkpointer.setup()
+    get_checkpointer()
 
     print("PostgreSQL checkpointer setup complete.")
 

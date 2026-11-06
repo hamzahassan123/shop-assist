@@ -1,26 +1,37 @@
-import uuid
+import os
 import logging
+import uuid
+from datetime import datetime, timedelta, timezone
 
+import extra_streamlit_components as stx
+import httpx
+import psycopg
+import requests
 import streamlit as st
+from dotenv import load_dotenv
+from google.genai.errors import APIError as GoogleGenAIAPIError
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
 
-from shop_assist.db import (
-    get_checkpointer,
-    get_conversations,
-)
+from shop_assist.db import get_checkpointer, get_conversations
 from shop_assist.graph import build_graph
-from shop_assist.logging_config import configure_logging
+from shop_assist.logging_config import (
+    configure_logging,
+    conversation_id_context,
+)
+from shop_assist.security import sanitize_pii
+from shop_assist.utils import content_to_text
 
 
+load_dotenv()
 configure_logging()
-
 logger = logging.getLogger(__name__)
 
-
-# =========================================================
-# PAGE CONFIG
-# =========================================================
+STOREFRONT_URL = os.getenv(
+    "SHOPIFY_STOREFRONT_URL",
+    "https://cogent-uffhonio.myshopify.com/",
+)
+STOREFRONT_PASSWORD = os.getenv("SHOPIFY_STOREFRONT_PASSWORD")
 
 st.set_page_config(
     page_title="ShopAssist",
@@ -29,534 +40,355 @@ st.set_page_config(
 )
 
 
-# =========================================================
-# HELPERS
-# =========================================================
-
-def content_to_text(content) -> str:
-    """
-    Convert LangChain/Gemini message content into plain text.
-
-    Gemini can return content as either:
-
-        "plain text"
-
-    or:
-
-        [
-            {"type": "text", "text": "plain text"}
-        ]
-    """
-
-    if isinstance(content, str):
-        return content
-
-    if isinstance(content, list):
-        text_parts = []
-
-        for block in content:
-
-            if isinstance(block, str):
-                text_parts.append(block)
-
-            elif isinstance(block, dict):
-
-                if block.get("type") == "text":
-                    text = block.get("text")
-
-                    if text:
-                        text_parts.append(text)
-
-        return "\n".join(text_parts)
-
-    return str(content)
+@st.cache_resource
+def get_graph():
+    return build_graph(get_checkpointer())
 
 
-def run_graph(input_data, config):
-    try:
-        with get_checkpointer() as checkpointer:
-            graph = build_graph(checkpointer)
-            return graph.invoke(input_data, config)
-
-    except Exception:
-        logger.exception("Graph execution failed")
-        raise
+def new_conversation_id(user_session_id: str) -> str:
+    return f"{user_session_id}:{uuid.uuid4().hex[:12]}"
 
 
 def load_conversation(config):
-    """
-    Load the latest conversation state from PostgreSQL.
-    """
-
-    with get_checkpointer() as checkpointer:
-
-        graph = build_graph(checkpointer)
-
-        state = graph.get_state(config)
-
-        if state.values:
-            return state.values.get(
-                "messages",
-                []
-            )
-
+    """Load the latest conversation state from PostgreSQL."""
+    state = get_graph().get_state(config)
+    if state.values:
+        return state.values.get("messages", [])
     return []
 
 
-def new_conversation_id():
-    return f"conversation-{uuid.uuid4().hex[:12]}"
-
-
 def load_messages_for_ui(config):
-
-    persisted_messages = load_conversation(config)
-
     messages = []
-
-    for message in persisted_messages:
-
+    for message in load_conversation(config):
         if isinstance(message, HumanMessage):
-
-            text = content_to_text(message.content)
-
-            if text:
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": text,
-                    }
-                )
-
+            role = "user"
         elif isinstance(message, AIMessage):
+            role = "assistant"
+        else:
+            continue
 
-            text = content_to_text(message.content)
-
-            if text:
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": text,
-                    }
-                )
-
+        text = content_to_text(message.content)
+        if text:
+            messages.append({"role": role, "content": text})
     return messages
 
 
-# =========================================================
-# CONVERSATION INITIALIZATION
-# =========================================================
+def _tool_status(tool_name: str, completed: bool = False) -> str:
+    labels = {
+        "lookup_order": "🔍 Looking up order",
+        "lookup_fulfillment": "🚚 Checking fulfillment",
+        "search_store_policy": "📚 Searching policies",
+        "cancel_shopify_order": "🛑 Processing cancellation",
+    }
+    label = labels.get(tool_name, "Using support tool")
+    return f"{label} complete..." if completed else f"{label}..."
+
+
+def stream_graph(input_data, config, status):
+    """Stream model tokens through the graph's synchronous checkpointer."""
+    graph = get_graph()
+    graph_output = {}
+
+    def graph_chunks():
+        for event in graph.stream(
+            input_data,
+            config=config,
+            stream_mode=["messages", "updates"],
+            version="v2",
+        ):
+            if event["type"] == "messages":
+                chunk, metadata = event["data"]
+                if metadata.get("langgraph_node") == "agent":
+                    text = content_to_text(getattr(chunk, "content", ""))
+                    if text:
+                        yield text
+            elif event["type"] == "updates":
+                for node, update in event["data"].items():
+                    if node == "__interrupt__":
+                        graph_output["__interrupt__"] = update
+                    elif node == "agent":
+                        messages = update.get("messages", [])
+                        if messages:
+                            for tool_call in getattr(messages[-1], "tool_calls", []):
+                                status.update(
+                                    label=_tool_status(tool_call["name"])
+                                )
+                    elif node == "tools":
+                        for tool_message in update.get("messages", []):
+                            status.update(
+                                label=_tool_status(
+                                    tool_message.name,
+                                    completed=True,
+                                )
+                            )
+
+    streamed_text = st.write_stream(graph_chunks())
+    return streamed_text, graph_output
+
+
+def get_pending_interrupt(graph_output, state):
+    interrupts = graph_output.get("__interrupt__", ())
+    if interrupts:
+        first_interrupt = interrupts[0]
+        return getattr(first_interrupt, "value", first_interrupt)
+
+    for task in state.tasks:
+        if task.interrupts:
+            return task.interrupts[0].value
+    return None
+
+
+def get_latest_assistant_text(state, streamed_text: str) -> str:
+    if streamed_text:
+        return streamed_text
+
+    messages = state.values.get("messages", [])
+    if messages:
+        return content_to_text(messages[-1].content)
+    return ""
+
+
+def show_processing_error(action: str, message: str, error: Exception, status) -> None:
+    logger.exception("%s: %s", action, error)
+    status.update(label="Request failed", state="error", expanded=False)
+    st.error(message)
+
+
+# The cookie is a browser-session namespace, not an authentication credential.
+cookie_manager = stx.CookieManager(key="shop-assist-session-cookie")
+cookie_value = cookie_manager.get("user_session_id")
+if "user_session_id" not in st.session_state:
+    try:
+        user_session_id = uuid.UUID(str(cookie_value)).hex
+    except (ValueError, AttributeError):
+        user_session_id = uuid.uuid4().hex
+        cookie_manager.set(
+            "user_session_id",
+            user_session_id,
+            expires_at=datetime.now(timezone.utc) + timedelta(days=365),
+        )
+    st.session_state.user_session_id = user_session_id
+
+user_session_id = st.session_state.user_session_id
+thread_prefix = f"{user_session_id}:"
 
 if "conversation_id" not in st.session_state:
-
-    conversation_id = st.query_params.get(
-        "conversation_id"
-    )
-
-    if not conversation_id:
-        conversation_id = new_conversation_id()
-
-        st.query_params["conversation_id"] = (
-            conversation_id
-        )
-
+    conversation_id = st.query_params.get("conversation_id")
+    if not conversation_id or not conversation_id.startswith(thread_prefix):
+        conversation_id = new_conversation_id(user_session_id)
     st.session_state.conversation_id = conversation_id
-
+    st.query_params["conversation_id"] = conversation_id
 
 conversation_id = st.session_state.conversation_id
-
-config = {
-    "configurable": {
-        "thread_id": conversation_id
-    }
-}
-
-
-# =========================================================
-# LOAD CURRENT CONVERSATION
-# =========================================================
+conversation_id_context.set(conversation_id)
+config = {"configurable": {"thread_id": conversation_id}}
 
 if "messages" not in st.session_state:
-
-    st.session_state.messages = (
-        load_messages_for_ui(config)
-    )
-
+    st.session_state.messages = load_messages_for_ui(config)
 
 if "pending_interrupt" not in st.session_state:
+    state = get_graph().get_state(config)
+    st.session_state.pending_interrupt = get_pending_interrupt({}, state)
 
-    st.session_state.pending_interrupt = None
-
-
-# =========================================================
-# SIDEBAR
-# =========================================================
 
 with st.sidebar:
-
     st.title("🛍️ ShopAssist")
 
-    if st.button(
-        "＋ New conversation",
-        use_container_width=True,
-    ):
+    st.link_button("Open Cogent storefront", STOREFRONT_URL, width="stretch")
+    if STOREFRONT_PASSWORD:
+        st.caption("Storefront password")
+        st.code(STOREFRONT_PASSWORD)
+    else:
+        st.caption("Store password: 123")
 
-        conversation_id = new_conversation_id()
+    st.divider()
 
-        st.session_state.conversation_id = (
-            conversation_id
-        )
-
+    if st.button("＋ New conversation", width="stretch"):
+        conversation_id = new_conversation_id(user_session_id)
+        st.session_state.conversation_id = conversation_id
         st.session_state.messages = []
-
         st.session_state.pending_interrupt = None
-
-        st.query_params["conversation_id"] = (
-            conversation_id
-        )
-
+        st.query_params["conversation_id"] = conversation_id
         st.rerun()
 
     st.divider()
-
     st.subheader("Saved conversations")
-
-    conversations = get_conversations()
-
-    current_thread_found = False
+    conversations = get_conversations(user_session_id=user_session_id)
 
     for conversation in conversations:
-
         thread_id = conversation["thread_id"]
-
         title = conversation["title"]
-
-        if thread_id == conversation_id:
-            current_thread_found = True
-
-        # Keep sidebar titles short.
-        display_title = title
-
-        if len(display_title) > 42:
-            display_title = display_title[:42] + "..."
-
-        is_current = thread_id == conversation_id
-
-        button_label = (
-            f"● {display_title}"
-            if is_current
-            else display_title
-        )
+        display_title = title[:42] + "..." if len(title) > 42 else title
+        label = f"● {display_title}" if thread_id == conversation_id else display_title
 
         if st.button(
-            button_label,
+            label,
             key=f"conversation-{thread_id}",
-            use_container_width=True,
+            width="stretch",
         ):
-
-            st.session_state.conversation_id = (
-                thread_id
+            st.session_state.conversation_id = thread_id
+            st.session_state.messages = load_messages_for_ui(
+                {"configurable": {"thread_id": thread_id}}
             )
-
-            st.session_state.messages = (
-                load_messages_for_ui(
-                    {
-                        "configurable": {
-                            "thread_id": thread_id
-                        }
-                    }
-                )
-            )
-
             st.session_state.pending_interrupt = None
-
-            st.query_params["conversation_id"] = (
-                thread_id
-            )
-
+            st.query_params["conversation_id"] = thread_id
             st.rerun()
 
     if not conversations:
-
-        st.caption(
-            "No saved conversations yet."
-        )
+        st.caption("No saved conversations yet.")
 
     st.divider()
+    st.caption(f"Conversation ID: {conversation_id}")
 
-    st.caption(
-        f"Conversation ID: {conversation_id}"
-    )
-
-
-# =========================================================
-# HEADER
-# =========================================================
 
 st.title("Customer Support")
-
-st.caption(
-    "AI customer support for the Cogent Shopify store."
-)
-
-
-# =========================================================
-# DISPLAY CURRENT CONVERSATION
-# =========================================================
+st.caption("AI customer support for the Cogent Shopify store.")
 
 for message in st.session_state.messages:
-
     with st.chat_message(message["role"]):
+        st.markdown(message["content"])
 
-        st.markdown(
-            message["content"]
-        )
-
-
-# =========================================================
-# HITL APPROVAL
-# =========================================================
 
 if st.session_state.pending_interrupt:
-
-    interrupt_data = (
-        st.session_state.pending_interrupt
-    )
-
+    interrupt_data = st.session_state.pending_interrupt
     order = interrupt_data["order"]
 
-    st.warning(
-        "Human approval required"
+    st.warning("Human approval required")
+    st.subheader(f"Cancel order #{interrupt_data['order_number']}")
+    financial_col, fulfillment_col = st.columns(2)
+    financial_col.metric("Financial status", order["financial_status"])
+    fulfillment_col.metric("Fulfillment status", order["fulfillment_status"])
+    st.caption(f"Created: {order['created_at']}")
+    st.write(
+        f"Refund: {interrupt_data['refund']} · "
+        f"Restock inventory: {interrupt_data['restock']} · "
+        f"Notify customer: {interrupt_data['notify_customer']}"
     )
+    st.dataframe(order["items"], hide_index=True, width="stretch")
 
-    st.markdown(
-        f"""
-### Cancel order #{interrupt_data["order_number"]}
-
-**Created:** {order["created_at"]}
-
-**Financial status:** {order["financial_status"]}
-
-**Fulfillment status:** {order["fulfillment_status"]}
-
-**Refund:** {interrupt_data["refund"]}
-
-**Restock inventory:** {interrupt_data["restock"]}
-
-**Notify customer:** {interrupt_data["notify_customer"]}
-"""
+    approve_col, reject_col = st.columns(2)
+    approve = approve_col.button(
+        "✅ Approve cancellation",
+        width="stretch",
     )
+    reject = reject_col.button("❌ Reject", width="stretch")
 
-    st.write("Items:")
-
-    for item in order["items"]:
-
-        st.write(
-            f"- {item['name']} × {item['quantity']}"
+    if approve or reject:
+        action = "approve" if approve else "reject"
+        action_label = (
+            "Failed to process approved cancellation"
+            if approve
+            else "Failed to process rejected cancellation"
+        )
+        friendly_message = (
+            "Sorry, the cancellation could not be processed. Please try again."
+            if approve
+            else "Sorry, we could not process your decision. Please try again."
         )
 
-    col1, col2 = st.columns(2)
+        with st.chat_message("assistant"):
+            with st.status("Processing your decision...", expanded=True) as status:
+                try:
+                    streamed_text, graph_output = stream_graph(
+                        Command(resume={"action": action}),
+                        config,
+                        status,
+                    )
+                    state = get_graph().get_state(config)
+                    pending_interrupt = get_pending_interrupt(graph_output, state)
+                except (
+                    requests.RequestException,
+                    psycopg.Error,
+                    GoogleGenAIAPIError,
+                    httpx.RequestError,
+                    TimeoutError,
+                    ConnectionError,
+                ) as error:
+                    show_processing_error(
+                        action_label,
+                        friendly_message,
+                        error,
+                        status,
+                    )
+                else:
+                    st.session_state.pending_interrupt = pending_interrupt
+                    if pending_interrupt is None:
+                        response = get_latest_assistant_text(state, streamed_text)
+                        if response:
+                            if not streamed_text:
+                                st.markdown(response)
+                            st.session_state.messages.append(
+                                {"role": "assistant", "content": response}
+                            )
+                    status.update(
+                        label=(
+                            "Approval required"
+                            if pending_interrupt
+                            else "Decision processed"
+                        ),
+                        state="complete",
+                        expanded=True,
+                    )
+                    st.rerun()
 
-    with col1:
-
-        approve = st.button(
-            "✅ Approve cancellation",
-            use_container_width=True,
-        )
-
-    with col2:
-
-        reject = st.button(
-            "❌ Reject",
-            use_container_width=True,
-        )
-
-    # -----------------------------------------------------
-    # APPROVE CANCELLATION
-    # -----------------------------------------------------
-
-    if approve:
-
-        try:
-
-            with st.spinner(
-                "Processing cancellation..."
-            ):
-
-                result = run_graph(
-                    Command(
-                        resume={
-                            "action": "approve"
-                        }
-                    ),
-                    config,
-                )
-
-        except Exception:
-
-            logger.exception(
-                "Failed to process approved cancellation"
-            )
-
-            st.error(
-                "Sorry, the cancellation could not be "
-                "processed. Please try again."
-            )
-
-        else:
-
-            st.session_state.pending_interrupt = None
-
-            response = content_to_text(
-                result["messages"][-1].content
-            )
-
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": response,
-                }
-            )
-
-            st.rerun()
-
-    # -----------------------------------------------------
-    # REJECT CANCELLATION
-    # -----------------------------------------------------
-
-    if reject:
-
-        try:
-
-            with st.spinner(
-                "Rejecting cancellation..."
-            ):
-
-                result = run_graph(
-                    Command(
-                        resume={
-                            "action": "reject"
-                        }
-                    ),
-                    config,
-                )
-
-        except Exception:
-
-            logger.exception(
-                "Failed to process rejected cancellation"
-            )
-
-            st.error(
-                "Sorry, we could not process your "
-                "cancellation decision. Please try again."
-            )
-
-        else:
-
-            st.session_state.pending_interrupt = None
-
-            response = content_to_text(
-                result["messages"][-1].content
-            )
-
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": response,
-                }
-            )
-
-            st.rerun()
-
-
-# =========================================================
-# CHAT INPUT
-# =========================================================
 
 if not st.session_state.pending_interrupt:
-
     prompt = st.chat_input(
         "Ask about an order, shipping, returns, refunds..."
     )
 
     if prompt:
-
+        safe_prompt = sanitize_pii(prompt)
         st.session_state.messages.append(
-            {
-                "role": "user",
-                "content": prompt,
-            }
+            {"role": "user", "content": safe_prompt}
         )
 
         with st.chat_message("user"):
-
-            st.markdown(prompt)
+            st.markdown(safe_prompt)
 
         with st.chat_message("assistant"):
-
-            try:
-
-                with st.spinner("Thinking..."):
-
-                    result = run_graph(
-                        {
-                            "messages": [
-                                HumanMessage(
-                                    content=prompt
-                                )
-                            ]
-                        },
+            with st.status("Thinking...", expanded=True) as status:
+                try:
+                    streamed_text, graph_output = stream_graph(
+                        {"messages": [HumanMessage(content=safe_prompt)]},
                         config,
+                        status,
                     )
-
-            except Exception:
-
-                logger.exception(
-                    "Failed to process customer message"
-                )
-
-                st.error(
-                    "Sorry, something went wrong while "
-                    "processing your request. Please try again."
-                )
-
-            else:
-
-                # -----------------------------------------
-                # HITL interrupt
-                # -----------------------------------------
-
-                if "__interrupt__" in result:
-
-                    interrupt_data = (
-                        result[
-                            "__interrupt__"
-                        ][0].value
+                    state = get_graph().get_state(config)
+                    pending_interrupt = get_pending_interrupt(graph_output, state)
+                except (
+                    requests.RequestException,
+                    psycopg.Error,
+                    GoogleGenAIAPIError,
+                    httpx.RequestError,
+                    TimeoutError,
+                    ConnectionError,
+                ) as error:
+                    show_processing_error(
+                        "Failed to process customer message",
+                        "Sorry, the service is temporarily unavailable. Please try again.",
+                        error,
+                        status,
                     )
-
-                    st.session_state.pending_interrupt = (
-                        interrupt_data
-                    )
-
-                    st.rerun()
-
-                # -----------------------------------------
-                # Normal response
-                # -----------------------------------------
-
                 else:
+                    if pending_interrupt is not None:
+                        st.session_state.pending_interrupt = pending_interrupt
+                        status.update(
+                            label="Approval required",
+                            state="complete",
+                            expanded=False,
+                        )
+                        st.rerun()
 
-                    response = content_to_text(
-                        result[
-                            "messages"
-                        ][-1].content
-                    )
-
-                    st.markdown(response)
-
-                    st.session_state.messages.append(
-                        {
-                            "role": "assistant",
-                            "content": response,
-                        }
+                    response = get_latest_assistant_text(state, streamed_text)
+                    if response:
+                        if not streamed_text:
+                            st.markdown(response)
+                        st.session_state.messages.append(
+                            {"role": "assistant", "content": response}
+                        )
+                    status.update(
+                        label="Response ready",
+                        state="complete",
+                        expanded=True,
                     )
