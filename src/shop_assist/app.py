@@ -83,6 +83,10 @@ def _tool_status(tool_name: str, completed: bool = False) -> str:
     label = labels.get(tool_name, "Using support tool")
     return f"{label} complete..." if completed else f"{label}..."
 
+import logging
+from langchain_google_genai.chat_models import GoogleRateLimitError
+
+logger = logging.getLogger(__name__)
 
 def stream_graph(input_data, config, status):
     """Stream model tokens through the graph's synchronous checkpointer."""
@@ -122,9 +126,23 @@ def stream_graph(input_data, config, status):
                                 )
                             )
 
-    streamed_text = st.write_stream(graph_chunks())
-    return streamed_text, graph_output
+    try:
+        # Stream the text to the UI
+        streamed_text = st.write_stream(graph_chunks())
+        return streamed_text, graph_output
 
+    except GoogleRateLimitError:
+        logger.warning("Google API Rate Limit Exceeded during streaming.")
+        # Stop the loading spinner and mark it as an error
+        status.update(label="Rate limit reached", state="error", expanded=False)
+        st.error("⏳ We're receiving too many requests right now. Please wait a moment and try again.")
+        return "", graph_output
+
+    except Exception as e:
+        logger.exception("An error occurred during graph streaming.")
+        status.update(label="An unexpected error occurred", state="error", expanded=False)
+        st.error("Sorry, something went wrong while processing your request. Please try again.")
+        return "", graph_output
 
 def get_pending_interrupt(graph_output, state):
     interrupts = graph_output.get("__interrupt__", ())
